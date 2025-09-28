@@ -1,119 +1,158 @@
 import requests
-from pandas.io.json import json_normalize
 import pandas as pd
-import json
-import numpy as np
 import matplotlib.pyplot as plt
+import io
+import json as _json
 
-import ssl
+# Data source (Serbian open data)
+URL = "https://opendata.stat.gov.rs/data/WcfJsonRestService.Service1.svc/dataset/0306IND01/2/json"
 
+# ---------------------------
+# Fetch and parse JSON robustly
+# ---------------------------
+resp = requests.get(URL, timeout=30)
+resp.raise_for_status()
+
+text = resp.text.lstrip("\ufeff").strip()  # tolerate BOMs
+
+dataset = None
 try:
-    _create_unverified_https_context = ssl._create_unverified_context
-except AttributeError:
-    # Legacy Python that doesn't verify HTTPS certificates by default
-    pass
+    data = resp.json()  # fast path
+except ValueError:
+    try:
+        data = _json.loads(text)  # fallback
+    except Exception:
+        # last resort: let pandas parse from string
+        dataset = pd.read_json(io.StringIO(text))
+        data = None
+
+if dataset is None:
+    if isinstance(data, list):
+        dataset = pd.DataFrame(data)
+    elif isinstance(data, dict):
+        # try common wrappers in case the provider changes shape
+        for key in ("items", "data", "results", "value"):
+            if key in data and isinstance(data[key], list):
+                dataset = pd.DataFrame(data[key])
+                break
+        else:
+            dataset = pd.json_normalize(data)
+    else:
+        raise SystemExit("Unexpected JSON structure from the API.")
+
+# Ensure numeric typing and drop invalid rows
+dataset["vrednost"] = pd.to_numeric(dataset["vrednost"], errors="coerce")
+dataset["god"] = pd.to_numeric(dataset["god"], errors="coerce")
+dataset = dataset.dropna(subset=["vrednost", "god"]).copy()
+
+# ---------------------------
+# Product name mapping (SR -> EN)
+# ---------------------------
+mapping = {
+    'Pšenica':'Wheat', 
+    'Ječam':'Barley', 
+    'Kukuruz':'Corn', 
+    'Ovas':'Oat', 
+    'Raž':'Rye', 
+    'Uljana repica':'Oilseed rape',
+    'Šećerna repa':'Sugar beet', 
+    'Suncokret':'Sunflower', 
+    'Soja':'Soy', 
+    'Duvan':'Tobacco', 
+    'Krompir':'Potato',
+    'Paradajz':'Tomato', 
+    'Kupus i kelj':'Cabbage and kale', 
+    'Crni luk':'Onion', 
+    'Paprika':'Pepper', 
+    'Pasulj':'Bean',
+    'Dinje i lubenice':'Melon and Watermelon', 
+    'Lucerka':'Alfalfa', 
+    'Jabuke':'Apples', 
+    'Kruške':'Pear', 
+    'Šljive':'Plum',
+    'Orasi':'Nuts', 
+    'Grožđe':'Grapes', 
+    'Jagode':'Strawberries', 
+    'Maline':'Raspberries', 
+    'Trešnje':'Cherries', 
+    'Višnje':'Sour cherries',
+    'Kajsije':'Apricots', 
+    'Breskve':'Peach', 
+    'mršave i mesnate svinje':'fleshy pigs',
+    'masne i polumasne svinje':'fat pigs', 
+    'Ovce - ukupno':'sheeps', 
+    'Tovni pilići':'Chickens',
+    'Kravlje mleko, mil.l':'Cow milk', 
+    'Ovčije mleko, mil.l':'Sheep milk', 
+    'Jaja, mil.kom.':'Eggs',
+    'Vuna, t':'Wool', 
+    'Med, t':'Honey'
+}
+
+# Apply mapping
+if "nProizvod" in dataset.columns:
+    dataset['nProizvod'] = dataset['nProizvod'].replace(mapping)
 else:
-    # Handle target environment that doesn't support HTTPS verification
-    ssl._create_default_https_context = _create_unverified_https_context
-    
-url = 'https://opendata.stat.gov.rs/data/WcfJsonRestService.Service1.svc/dataset/0306IND01/2/json'
-dataset = pd.read_json(url)
+    raise SystemExit("Column 'nProizvod' is missing from the dataset.")
 
-dataset['vrednost'] = pd.to_numeric(dataset['vrednost'])
-dataset['god'] = pd.to_numeric(dataset['god'])
+# ---------------------------
+# Interactive selection
+# ---------------------------
+unique_names = sorted(map(str, dataset['nProizvod'].dropna().unique()))
+print("Here is a list of products for which you can check prices over the years:\n")
+for name in unique_names:
+    print(" -", name)
 
-# checking for names of agriculture products for translate to English
-dataset['nProizvod'].unique()
+user_input = input("\nEnter product name exactly as shown above: ").strip()
+lookup = {x.casefold(): x for x in unique_names}
+if user_input.casefold() not in lookup:
+    raise SystemExit(f"Product '{user_input}' not found. Please run again and choose one from the list.")
+product = lookup[user_input.casefold()]
 
-#renaming agriculture products from Serbian to English
+# ---------------------------
+# Filtering and metrics
+# ---------------------------
+cond = dataset.loc[dataset['nProizvod'] == product].copy()
+cond = cond.sort_values('god')
+cond['price_relation_to_previous_year'] = (
+    cond['vrednost'].pct_change().fillna(0).round(4)
+)
+cond = cond.loc[:, ['nProizvod', 'god', 'vrednost', 'price_relation_to_previous_year']]
 
-mapping = {'Pšenica':'Wheat', 
-           'Ječam':'Barley', 
-           'Kukuruz':'Corn', 
-           'Ovas':'Oat', 
-           'Raž':'Rye', 
-           'Uljana repica':'Oilseed rape',
-           'Šećerna repa':'Sugar beet', 
-           'Suncokret':'Sunflower', 
-           'Soja':'Soy', 
-           'Duvan':'Tobacco', 
-           'Krompir':'Potato',
-           'Paradajz':'Tomato', 
-           'Kupus i kelj':'Cabbage and kale', 
-           'Crni luk':'Onion', 
-           'Paprika':'Pepper', 
-           'Pasulj':'Bean',
-           'Dinje i lubenice':'Melon and Watermelon', 
-           'Lucerka':'Alfalfa', 
-           'Jabuke':"Apples", 
-           'Kruške':'Pear', 
-           'Šljive':'Plum',
-           'Orasi':'Nuts', 
-           'Grožđe':'Grapes', 
-           'Jagode':'Strawberries', 
-           'Maline':'Raspberries', 
-           'Trešnje':'Cherries', 
-           'Višnje':'Sour cherries',
-           'Kajsije':'Apricots', 
-           'Breskve':'Peach', 
-           'mršave i mesnate svinje':'fleshy pigs',
-           'masne i polumasne svinje':'fat pigs', 
-           'Ovce - ukupno':'sheeps', 
-           'Tovni pilići':'Chickens',
-           'Kravlje mleko, mil.l':'Cow milk', 
-           'Ovčije mleko, mil.l':'Sheep milk', 
-           'Jaja, mil.kom.':'Eggs',
-           'Vuna, t':'Wool', 
-           'Med, t':'Honey'
-           }
+# Largest decrease & increase (YoY)
+max_dec = cond['price_relation_to_previous_year'].min()
+max_inc = cond['price_relation_to_previous_year'].max()
 
-# after changing name of agriculture products
-# list is printed for corrected values to be entered
+year_max_dec = int(cond.loc[cond['price_relation_to_previous_year'] == max_dec, 'god'].iloc[0])
+year_max_inc = int(cond.loc[cond['price_relation_to_previous_year'] == max_inc, 'god'].iloc[0])
 
-dataset['nProizvod'] = dataset['nProizvod'].replace(mapping)
-unique_names = dataset['nProizvod'].unique()
-print("Here is a list of products for which you can check prices over the years: ")
-print(unique_names)
+price_at_dec = float(cond.loc[cond['god'] == year_max_dec, 'vrednost'].iloc[0])
+price_before_dec = round(price_at_dec / (1 + max_dec), 2)
 
-# creating variable with name of product
-product = str(input("Enter product name: "))
-# selecting data with only selected product
-cond = dataset.loc[dataset['nProizvod'] == product]
-# creating new column with pecentage of price change for each row
-cond['price relation to previous year'] = cond['vrednost'].pct_change().fillna(0)
-# rounding values to 4 decimals for easy viewing
-cond['price relation to previous year'] = cond['price relation to previous year'].round(4)
-# dropping unnecessary columns 
-cond = (cond.loc[:, ['nProizvod', 'god', 'vrednost', 'price relation to previous year']])
+price_at_inc = float(cond.loc[cond['god'] == year_max_inc, 'vrednost'].iloc[0])
+price_before_inc = round(price_at_inc / (1 + max_inc), 2)
 
-# putting all data into senteces for easy understanding
-# and for extracting key data for prices over the year
+print(
+    f"\nFor {product} biggest decrease in price was in year {year_max_dec} "
+    f"where price was {price_at_dec} RSD, a total decrease of {round(max_dec*100, 2)}% "
+    f"from the previous year {year_max_dec - 1} where price was {price_before_dec} RSD."
+)
+print(
+    f"For {product} biggest increase in price was in year {year_max_inc} "
+    f"where price was {price_at_inc} RSD, a total increase of {round(max_inc*100, 2)}% "
+    f"from the previous year {year_max_inc - 1} where price was {price_before_inc} RSD."
+)
 
-max_price_decrease = cond['price relation to previous year'].min()
-max_price_increase = cond['price relation to previous year'].max()
-year_max_price_decrease = cond.loc[cond['price relation to previous year']==max_price_decrease, 'god'].values[0]
-year_max_price_decrease_previous = year_max_price_decrease - 1
-year_max_price_increase = cond.loc[cond['price relation to previous year']==max_price_increase, 'god'].values[0]
-year_max_price_increase_previous = year_max_price_increase - 1
-purchase_price_max_decrease = cond.loc[cond['price relation to previous year']==max_price_decrease, 'vrednost'].values[0]
-purchase_price_max_decrease_previous = (purchase_price_max_decrease/(1 + max_price_decrease)).round(2)
-purchase_price_max_increase = cond.loc[cond['price relation to previous year']==max_price_increase, 'vrednost'].values[0]
-purchase_price_max_increase_previous = (purchase_price_max_increase/(1 + max_price_increase)).round(2)
-print("For " + str(product) + " biggest decrease in price was in year " + str(year_max_price_decrease) + 
-      " where price was " + str(purchase_price_max_decrease) + "rsd" + " which is total decrease of " + 
-      str((max_price_decrease*100).round(2)) + "%" + " from previous year " + str(year_max_price_decrease_previous)
-      + " where price was " + str(purchase_price_max_decrease_previous) + "rsd")
-print("For " + str(product) + " biggest increase in price was in year " + str(year_max_price_increase) + 
-      " where price was " + str(purchase_price_max_increase) + "rsd" + " which is total decrease of " + 
-      str((max_price_increase*100).round(2)) + "%" + " from previous year " + str(year_max_price_increase_previous)
-      + " where price was " + str(purchase_price_max_increase_previous) + "rsd")
-
-year = dataset['god'].unique()
-
-# creating bar plot
+# ---------------------------
+# Plot
+# ---------------------------
 fig, ax = plt.subplots()
-ax.bar(year, cond['vrednost'])
+ax.bar(cond['god'].astype(int), cond['vrednost'])
 ax.set_xlabel('Year')
-ax.set_ylabel('Price')
-ax.set_title('Price of ' + str(product) + " from year " + str(dataset['god'].min()) + "-" + str(dataset['god'].max()))
+ax.set_ylabel('Price (RSD)')
+ax.set_title(
+    f"Price of {product} from year {int(cond['god'].min())}-{int(cond['god'].max())}"
+)
+plt.xticks(rotation=45)
+plt.tight_layout()
 plt.show()
